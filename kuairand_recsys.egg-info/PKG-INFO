@@ -1,0 +1,99 @@
+Metadata-Version: 2.4
+Name: kuairand-recsys
+Version: 0.1.0
+Summary: Two-stage recommender MVP for KuaiRand
+Requires-Python: <3.13,>=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.116.0
+Requires-Dist: uvicorn[standard]>=0.35.0
+Requires-Dist: pydantic>=2.11.0
+Requires-Dist: pydantic-settings>=2.10.0
+Requires-Dist: redis>=6.4.0
+Requires-Dist: qdrant-client>=1.15.0
+Requires-Dist: clickhouse-connect>=0.8.0
+Requires-Dist: sqlalchemy>=2.0.0
+Requires-Dist: psycopg[binary]>=3.2.0
+Requires-Dist: mlflow>=3.3.0
+Requires-Dist: numpy>=2.1.0
+Requires-Dist: pandas>=2.3.0
+Requires-Dist: scikit-learn>=1.7.0
+Requires-Dist: implicit>=0.7.2
+Requires-Dist: catboost>=1.2.8
+Requires-Dist: joblib>=1.5.0
+Requires-Dist: prometheus-client>=0.23.0
+Provides-Extra: spark
+Requires-Dist: pyspark>=3.5.0; extra == "spark"
+Provides-Extra: deep
+Requires-Dist: torch>=2.8.0; extra == "deep"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.4.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=1.1.0; extra == "dev"
+Requires-Dist: httpx>=0.28.0; extra == "dev"
+Requires-Dist: ruff>=0.12.0; extra == "dev"
+Requires-Dist: mypy>=1.17.0; extra == "dev"
+Requires-Dist: types-redis>=4.6.0.20241004; extra == "dev"
+
+# KuaiRand RecSys MVP
+
+Production-minded two-stage recommender MVP using `uv` + `pyproject.toml`.
+
+## Stack
+- Python 3.11+
+- FastAPI
+- Redis + Redis Streams
+- ClickHouse
+- Postgres
+- Qdrant
+- CatBoost + Implicit ALS/BPR + Two-Tower (PyTorch)
+- MLflow
+- Prometheus + Grafana
+
+## Quickstart
+```bash
+uv sync --extra dev --extra spark --extra deep
+cp .env.example .env
+docker compose up -d
+make api
+```
+
+## Common Commands
+```bash
+make lint
+make type
+make test
+make api
+make worker
+make etl
+make build-splits
+make train-als
+make train-bpr
+make train-two-tower
+make build-candidates
+make train-ranker
+make train-blend
+make eval-ranker
+make train-all
+```
+
+## API
+- `POST /v1/events`
+- `POST /v1/recommend`
+- `GET /v1/items/{item_id}/similar`
+- `POST /v1/experiments`
+- `GET /v1/experiments/{experiment_key}`
+- `POST /v1/experiments/assign`
+- `GET /health`
+- `GET /ready`
+- `GET /metrics`
+
+`/v1/recommend` returns:
+- `final_score`
+- `objective_scores` (`click`, `long_view`, `watch_time`)
+- `blend_features` (`als_score`, `bpr_score`, `two_tower_score`)
+- `candidate_count`
+- `experiment_assignments`
+
+## Notes
+- `/ready` now runs dependency checks and returns HTTP `503` when required components are unavailable.
+- Recommend requests auto-log impression events and served slates through Redis Streams for worker ingestion into ClickHouse.
+- Prometheus scrapes API and worker metrics; Grafana dashboard is provisioned at startup.

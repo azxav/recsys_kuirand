@@ -1,0 +1,119 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./infra/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: recsys
+      POSTGRES_PASSWORD: recsys
+      POSTGRES_DB: recsys
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recsys"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    healthcheck:
+      test: ["CMD", "sh", "-lc", "cat /proc/1/cmdline | grep -qa entrypoint.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.3.2
+    command: mlflow server --host 0.0.0.0 --port 5000
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    image: ghcr.io/astral-sh/uv:python3.12-bookworm
+    working_dir: /app
+    command: sh -c "uv sync --extra dev --extra spark --extra deep && uv run uvicorn services.api.main:app --host 0.0.0.0 --port 8000"
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    ports:
+      - "8000:8000"
+      - "9001:9001"
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  worker:
+    image: ghcr.io/astral-sh/uv:python3.12-bookworm
+    working_dir: /app
+    command: sh -c "uv sync --extra dev --extra spark --extra deep && METRICS_PORT=9002 uv run python -m services.worker.main"
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    ports:
+      - "9002:9002"
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+      - worker
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infra/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus

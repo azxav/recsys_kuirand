@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: uv sync --extra dev --extra spark
+      - name: Lint
+        run: uv run ruff check libs services pipelines tests scripts
+      - name: Type check
+        run: uv run mypy libs services pipelines
+      - name: Unit tests
+        run: uv run pytest -m "not integration"
