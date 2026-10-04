@@ -12,10 +12,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install deps
-        run: uv sync --extra dev --extra spark
+        run: uv sync --extra dev
       - name: Lint
         run: uv run ruff check libs services pipelines tests scripts
       - name: Type check
         run: uv run mypy libs services pipelines
       - name: Unit tests
         run: uv run pytest -m "not integration"
+      - name: Smoke eval
+        run: uv run python -m pipelines.training.offline_eval --smoke --output /tmp/kuairand-smoke-metrics.json
