@@ -1,4 +1,4 @@
-.PHONY: lint type test api worker etl build-splits train-pop train-als train-bpr train-two-tower build-candidates train-ranker train-blend eval-ranker train-all smoke-train
+.PHONY: lint type test api worker etl build-splits train-pop train-als train-bpr train-two-tower build-candidates train-ranker train-blend eval-ranker train-all smoke-train download-data eval smoke
 
 lint:
 	uv run ruff check libs services pipelines tests scripts
@@ -48,3 +48,12 @@ eval-ranker:
 train-all: train-als train-bpr train-two-tower build-candidates train-ranker train-blend
 
 smoke-train: etl train-all eval-ranker
+
+download-data:
+	bash scripts/download_kuairand_pure.sh
+
+eval:
+	uv run python -m pipelines.training.offline_eval --data-dir data/raw/KuaiRand-Pure/data --output results/kuairand_pure_metrics.json
+
+smoke:
+	uv run python -m pipelines.training.offline_eval --smoke --output /tmp/kuairand-smoke-metrics.json

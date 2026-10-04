@@ -8,6 +8,7 @@ __pycache__/
 uv.lock
 artifacts/
 data/
+mlruns/
 *.log
 .DS_Store
 catboost_info/
