@@ -12,12 +12,15 @@ import argparse
 import json
 import platform
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 from implicit.als import AlternatingLeastSquares
 from scipy.sparse import csr_matrix
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
 from threadpoolctl import threadpool_limits
 
@@ -32,12 +35,14 @@ TRAIN_LOG = "log_standard_4_08_to_4_21_pure.csv"
 TEST_LOG = "log_random_4_22_to_5_08_pure.csv"
 
 
-def _read_log(path: Path) -> pd.DataFrame:
-    frame = pd.read_csv(
-        path,
-        usecols=LOG_COLUMNS,
-        dtype={"user_id": np.int32, "video_id": np.int32, "is_click": np.int8},
-    )
+def _read_log(path: Path, extra: bool = False) -> pd.DataFrame:
+    columns = ["user_id", "video_id", "is_click"]
+    dtype: dict[str, type] = {"user_id": np.int32, "video_id": np.int32, "is_click": np.int8}
+    if extra:
+        columns.extend(["date", "play_time_ms"])
+        dtype["date"] = np.int32
+        dtype["play_time_ms"] = np.float32
+    frame = pd.read_csv(path, usecols=columns, dtype=dtype)
     if frame.empty:
         raise ValueError(f"{path} has no rows")
     return frame
@@ -241,6 +246,7 @@ def _ranker_frame(
     user_clicks: pd.Series,
     user_impr: pd.Series,
     global_ctr: float,
+    retrieval_scores: np.ndarray | None = None,
 ) -> pd.DataFrame:
     out = pd.DataFrame({"is_click": frame["is_click"].astype(np.int8)})
     video_ids = frame["video_id"].to_numpy()
@@ -253,6 +259,9 @@ def _ranker_frame(
     user_ctr = np.full(len(frame), global_ctr, dtype=np.float64)
     user_ctr[known_user] = _smoothed_rate(u_clicks[known_user], u_impr[known_user])
     out["user_ctr"] = user_ctr.astype(np.float32)
+    if retrieval_scores is not None:
+        out["als_score"] = np.asarray(retrieval_scores, dtype=np.float32)
+        return out
 
     als = np.zeros(len(frame), dtype=np.float32)
     user_codes = pd.Series(user_ids).map(user_index)
@@ -365,52 +374,389 @@ def evaluate_ranker(
     }
 
 
+def _clip_prob(probabilities: np.ndarray) -> np.ndarray:
+    return cast(np.ndarray, np.clip(probabilities, 1e-6, 1.0 - 1e-6))
+
+
+def _ranker_on_split(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    retrieval_model: Any,
+    iterations: int,
+    depth: int,
+    learning_rate: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    popularity = _item_popularity(train_df)
+    user_clicks = train_df.groupby("user_id")["is_click"].sum()
+    user_impr = train_df.groupby("user_id")["is_click"].size()
+    global_ctr = float(train_df["is_click"].mean())
+    train_scores = retrieval_model.pair_scores(
+        train_df["user_id"].to_numpy(), train_df["video_id"].to_numpy()
+    )
+    test_scores = retrieval_model.pair_scores(
+        test_df["user_id"].to_numpy(), test_df["video_id"].to_numpy()
+    )
+    empty = np.zeros((1, 1), dtype=np.float32)
+    train_x = _ranker_frame(
+        train_df,
+        retrieval_model.user_index,
+        retrieval_model.item_index,
+        empty,
+        empty,
+        popularity,
+        user_clicks,
+        user_impr,
+        global_ctr,
+        retrieval_scores=train_scores,
+    )
+    test_x = _ranker_frame(
+        test_df,
+        retrieval_model.user_index,
+        retrieval_model.item_index,
+        empty,
+        empty,
+        popularity,
+        user_clicks,
+        user_impr,
+        global_ctr,
+        retrieval_scores=test_scores,
+    )
+    y_train = train_x["is_click"].to_numpy()
+    y_test = test_x["is_click"].to_numpy()
+    ranker = _fit_classifier(
+        train_x, y_train, RANKER_FEATURES, iterations, depth, learning_rate, seed
+    )
+    baseline = _fit_classifier(
+        train_x, y_train, POPULARITY_FEATURES, iterations, depth, learning_rate, seed
+    )
+    return (
+        y_test,
+        ranker.predict_proba(test_x[RANKER_FEATURES])[:, 1],
+        baseline.predict_proba(test_x[POPULARITY_FEATURES])[:, 1],
+    )
+
+
+def _calibrated_report(
+    y_val: np.ndarray,
+    raw_val: np.ndarray,
+    y_test: np.ndarray,
+    raw_test: np.ndarray,
+) -> dict[str, object]:
+    isotonic = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    isotonic.fit(raw_val, y_val)
+    platt = LogisticRegression(max_iter=500)
+    platt.fit(raw_val.reshape(-1, 1), y_val)
+    calibrated = {
+        "isotonic": isotonic.predict(raw_test),
+        "platt": platt.predict_proba(raw_test.reshape(-1, 1))[:, 1],
+    }
+    val_probs = {
+        "isotonic": isotonic.predict(raw_val),
+        "platt": platt.predict_proba(raw_val.reshape(-1, 1))[:, 1],
+    }
+    val_losses = {
+        name: round(float(log_loss(y_val, _clip_prob(prob), labels=[0, 1])), 6)
+        for name, prob in val_probs.items()
+    }
+    method = min(val_losses, key=lambda name: val_losses[name])
+    return {
+        "method": method,
+        "selected_by": "validation log loss",
+        "validation_logloss": val_losses,
+        "before": _classification_metrics(y_test, _clip_prob(raw_test)),
+        "after": _classification_metrics(
+            y_test, _clip_prob(np.asarray(calibrated[method], dtype=float))
+        ),
+    }
+
+
+def _fit_and_calibrate(
+    fit_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    als_model: Any,
+    selected_model: Any,
+    iterations: int,
+    depth: int,
+    learning_rate: float,
+    seed: int,
+    validation_start: int,
+) -> dict[str, object]:
+    """Fit on the pre-validation organic slice and calibrate on the held-out organic days."""
+
+    def predict_both(model: Any) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        # Two calls refit CatBoost. Seed makes that deterministic, but it is slower
+        # and the val/test models would match. Fit once by scoring both frames after one fit.
+        popularity = _item_popularity(fit_df)
+        user_clicks = fit_df.groupby("user_id")["is_click"].sum()
+        user_impr = fit_df.groupby("user_id")["is_click"].size()
+        global_ctr = float(fit_df["is_click"].mean())
+        empty = np.zeros((1, 1), dtype=np.float32)
+        frames = {}
+        for name, frame in (("train", fit_df), ("val", val_df), ("test", test_df)):
+            scores = model.pair_scores(frame["user_id"].to_numpy(), frame["video_id"].to_numpy())
+            built = _ranker_frame(
+                frame,
+                model.user_index,
+                model.item_index,
+                empty,
+                empty,
+                popularity,
+                user_clicks,
+                user_impr,
+                global_ctr,
+                retrieval_scores=scores,
+            )
+            frames[name] = built
+        y_train = frames["train"]["is_click"].to_numpy()
+        ranker = _fit_classifier(
+            frames["train"], y_train, RANKER_FEATURES, iterations, depth, learning_rate, seed
+        )
+        baseline = _fit_classifier(
+            frames["train"], y_train, POPULARITY_FEATURES, iterations, depth, learning_rate, seed
+        )
+        packed = {}
+        for name in ("val", "test"):
+            packed[name] = (
+                frames[name]["is_click"].to_numpy(),
+                ranker.predict_proba(frames[name][RANKER_FEATURES])[:, 1],
+                baseline.predict_proba(frames[name][POPULARITY_FEATURES])[:, 1],
+            )
+        return packed
+
+    als_pred = predict_both(als_model)
+    selected_pred = predict_both(selected_model)
+    y_val, als_val, pop_val = als_pred["val"]
+    y_test, als_test, pop_test = als_pred["test"]
+    _, selected_val, _ = selected_pred["val"]
+    y_selected_test, selected_test, _ = selected_pred["test"]
+    if not np.array_equal(y_test, y_selected_test):
+        raise RuntimeError("calibration targets changed between retrievers")
+    return {
+        "train_dates": f"< {validation_start}",
+        "calibration_dates": f">= {validation_start}",
+        "note": (
+            "Models are fit only on organic rows before the validation date. "
+            "Isotonic and Platt are fit on the later organic rows. "
+            "The method with lower validation log loss is applied to the random-policy test. "
+            "Test labels are not used to choose the calibrator."
+        ),
+        "catboost_als_previous": _calibrated_report(y_val, als_val, y_test, als_test),
+        "catboost_selected_retriever": _calibrated_report(
+            y_val, selected_val, y_test, selected_test
+        ),
+        "popularity": _calibrated_report(y_val, pop_val, y_test, pop_test),
+    }
+
+
 def run_eval(
     train: pd.DataFrame,
     test: pd.DataFrame,
-    factors: int,
-    als_iterations: int,
-    als_alpha: float,
+    selection: dict[str, object],
     ranker_iterations: int,
     ranker_depth: int,
     learning_rate: float,
     seed: int,
 ) -> dict[str, object]:
+    from pipelines.training.retrieval_tune import (
+        VAL_START_DATE,
+        _blend_scores,
+        build_eval_context,
+        metrics_for_scores,
+    )
+    from pipelines.training.retrievers import OLD_ALS, fit_als, fit_ease, fit_itemknn
+
     print(
         f"train_rows={len(train)} test_rows={len(test)} "
         f"train_users={train['user_id'].nunique()} test_users={test['user_id'].nunique()}",
         flush=True,
     )
-    print("fitting ALS", flush=True)
-    user_index, item_index, user_factors, item_factors = _fit_als(
-        train, factors, als_iterations, als_alpha, seed
+    chosen = selection["chosen"]
+    assert isinstance(chosen, dict)
+    als_cfg = chosen["als_tuned"]["config"]
+    knn_cfg = chosen["itemknn"]["config"]
+    ease_cfg = chosen["ease"]["config"]
+    hybrid_cfg = chosen["hybrid"]["config"]
+    assert isinstance(als_cfg, dict)
+    assert isinstance(knn_cfg, dict)
+    assert isinstance(ease_cfg, dict)
+    assert isinstance(hybrid_cfg, dict)
+
+    print("refitting retrievers on the full organic log", flush=True)
+    als_previous = fit_als(
+        train,
+        factors=int(OLD_ALS["factors"]),
+        regularization=float(OLD_ALS["regularization"]),
+        iterations=int(OLD_ALS["iterations"]),
+        alpha=float(OLD_ALS["alpha"]),
+        weighting=str(OLD_ALS["weighting"]),
+        seed=seed,
     )
+    als_tuned = fit_als(
+        train,
+        factors=int(als_cfg["factors"]),
+        regularization=float(als_cfg["regularization"]),
+        iterations=int(als_cfg["iterations"]),
+        alpha=float(als_cfg["alpha"]),
+        weighting=str(als_cfg["weighting"]),
+        seed=seed,
+    )
+    itemknn = fit_itemknn(train, kind=str(knn_cfg["kind"]), neighbors=int(knn_cfg["neighbors"]))
+    ease = fit_ease(
+        train, reg_lambda=float(ease_cfg["lambda"]), weighting=str(ease_cfg["weighting"])
+    )
+    fitted: dict[str, Any] = {"als_tuned": als_tuned, "itemknn": itemknn, "ease": ease}
+    ctx = build_eval_context(train, test)
+    hybrid_base = fitted[str(hybrid_cfg["base"])]
+    hybrid_weight = float(hybrid_cfg["weight"])
+    hybrid_kind = str(hybrid_cfg["blend"])
+
+    def hybrid_batch(batch: list[int]) -> np.ndarray:
+        collaborative = hybrid_base.score_batch(batch, ctx.catalog)
+        return _blend_scores(collaborative, ctx.pop_scores, hybrid_weight, hybrid_kind)
+
+    scorers = {
+        "popularity": lambda batch: np.broadcast_to(
+            ctx.pop_scores, (len(batch), len(ctx.catalog))
+        ).copy(),
+        "als": lambda batch: als_previous.score_batch(batch, ctx.catalog),
+        "als_tuned": lambda batch: als_tuned.score_batch(batch, ctx.catalog),
+        "itemknn": lambda batch: itemknn.score_batch(batch, ctx.catalog),
+        "ease": lambda batch: ease.score_batch(batch, ctx.catalog),
+        "hybrid": hybrid_batch,
+    }
+    print("scoring retrieval on the random-policy log", flush=True)
+    model_metrics = {name: metrics_for_scores(scorer, ctx) for name, scorer in scorers.items()}
+    print(json.dumps(model_metrics), flush=True)
     popularity = _item_popularity(train)
-    print("scoring retrieval", flush=True)
-    retrieval = evaluate_retrieval(
+    previous = evaluate_retrieval(
         train,
         test,
-        user_index,
-        item_index,
-        user_factors,
-        item_factors,
+        als_previous.user_index,
+        als_previous.item_index,
+        als_previous.user_factors,
+        als_previous.item_factors,
         popularity,
     )
-    print(json.dumps(retrieval["models"]), flush=True)
-    ranker = evaluate_ranker(
+    previous_models = previous["models"]
+    assert isinstance(previous_models, dict)
+    for model_name in ("als", "popularity"):
+        published = previous_models[model_name]
+        assert isinstance(published, dict)
+        for key, value in published.items():
+            if model_metrics[model_name][key] != value:
+                raise RuntimeError(
+                    f"retrieval metric drift for {model_name} {key}: "
+                    f"{model_metrics[model_name][key]} vs {value}"
+                )
+    retrieval = {
+        "protocol": (
+            "Full catalog. Warm users only (user had an organic click). "
+            "Relevance is random-policy clicks the user did not already click in the organic log. "
+            "Already-clicked organic items are removed from the ranked list. "
+            "Macro-average over users. "
+            "als is the previously published configuration. "
+            "als_tuned, itemknn, ease, and hybrid were selected on the organic validation "
+            f"slice (dates >= {VAL_START_DATE}) and refit on the full organic log."
+        ),
+        "k": list(RETRIEVAL_KS),
+        "n_users": int(cast(int, previous["n_users"])),
+        "n_items": int(cast(int, previous["n_items"])),
+        "models": model_metrics,
+    }
+
+    print("fitting uncalibrated ranker on the full organic log", flush=True)
+    y_test, ranker_prob, baseline_prob = _ranker_on_split(
+        train, test, als_previous, ranker_iterations, ranker_depth, learning_rate, seed
+    )
+    ranker_full = {
+        "protocol": (
+            "Pointwise click model fit on every organic impression and scored on every "
+            "random-policy impression. Retrieval feature is the previous ALS dot product. "
+            "No probability calibration."
+        ),
+        "features": {"catboost": RANKER_FEATURES, "popularity": POPULARITY_FEATURES},
+        "retrieval_feature": "als_previous",
+        "n_train": int(len(train)),
+        "n_test": int(len(test)),
+        "train_click_rate": round(float(train["is_click"].mean()), 6),
+        "test_click_rate": round(float(test["is_click"].mean()), 6),
+        "models": {
+            "catboost": _classification_metrics(y_test, ranker_prob),
+            "popularity": _classification_metrics(y_test, baseline_prob),
+        },
+    }
+    print(json.dumps(ranker_full["models"]), flush=True)
+
+    retriever_name = str(selection["ranker_retriever"])
+    print(f"refitting ranker with {retriever_name} scores", flush=True)
+    y_test_new, ranker_prob_new, baseline_prob_new = _ranker_on_split(
         train,
         test,
-        user_index,
-        item_index,
-        user_factors,
-        item_factors,
-        popularity,
+        fitted[retriever_name],
         ranker_iterations,
         ranker_depth,
         learning_rate,
         seed,
     )
-    print(json.dumps(ranker["models"]), flush=True)
+    ranker_improved = {
+        "protocol": (
+            "Same full-organic training protocol as the uncalibrated ranker. "
+            f"The retrieval feature is {retriever_name}, the pure retriever with the "
+            "best organic validation objective."
+        ),
+        "retrieval_feature": retriever_name,
+        "models": {
+            "catboost": _classification_metrics(y_test_new, ranker_prob_new),
+            "popularity": _classification_metrics(y_test_new, baseline_prob_new),
+        },
+    }
+    print(json.dumps(ranker_improved["models"]), flush=True)
+
+    fit_df = train.loc[train["date"] < VAL_START_DATE]
+    val_df = train.loc[train["date"] >= VAL_START_DATE]
+    print("calibrating rankers on the organic validation slice", flush=True)
+    als_fit = fit_als(
+        fit_df,
+        factors=int(OLD_ALS["factors"]),
+        regularization=float(OLD_ALS["regularization"]),
+        iterations=int(OLD_ALS["iterations"]),
+        alpha=float(OLD_ALS["alpha"]),
+        weighting=str(OLD_ALS["weighting"]),
+        seed=seed,
+    )
+    selected_fit = {
+        "als_tuned": lambda frame: fit_als(
+            frame,
+            factors=int(als_cfg["factors"]),
+            regularization=float(als_cfg["regularization"]),
+            iterations=int(als_cfg["iterations"]),
+            alpha=float(als_cfg["alpha"]),
+            weighting=str(als_cfg["weighting"]),
+            seed=seed,
+        ),
+        "itemknn": lambda frame: fit_itemknn(
+            frame, kind=str(knn_cfg["kind"]), neighbors=int(knn_cfg["neighbors"])
+        ),
+        "ease": lambda frame: fit_ease(
+            frame, reg_lambda=float(ease_cfg["lambda"]), weighting=str(ease_cfg["weighting"])
+        ),
+    }[retriever_name](fit_df)
+    calibration = _fit_and_calibrate(
+        fit_df,
+        val_df,
+        test,
+        als_fit,
+        selected_fit,
+        ranker_iterations,
+        ranker_depth,
+        learning_rate,
+        seed,
+        VAL_START_DATE,
+    )
+    print(json.dumps(calibration), flush=True)
+
     import catboost
     import implicit
     import sklearn
@@ -422,19 +768,21 @@ def run_eval(
         "test_log": TEST_LOG,
         "label": "is_click",
         "config": {
-            "factors": factors,
-            "als_iterations": als_iterations,
-            "als_regularization": 0.05,
-            "als_alpha": als_alpha,
+            "seed": seed,
+            "als_previous": OLD_ALS,
             "ranker_iterations": ranker_iterations,
             "ranker_depth": ranker_depth,
             "learning_rate": learning_rate,
             "l2_leaf_reg": 5.0,
             "monotone_constraints": True,
-            "seed": seed,
         },
+        "retrieval_selection": selection,
         "retrieval": retrieval,
-        "ranker": ranker,
+        "ranker": {
+            "uncalibrated_full_train": ranker_full,
+            "with_selected_retriever": ranker_improved,
+            "calibration": calibration,
+        },
         "versions": {
             "python": platform.python_version(),
             "numpy": np.__version__,
@@ -460,6 +808,8 @@ def _synthetic_logs(seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame]:
                     "user_id": user_id,
                     "video_id": video_id,
                     "is_click": click,
+                    "date": 20220410 if len(rows) % 25 < 18 else 20220420,
+                    "play_time_ms": float(rng.integers(1000, 20000)),
                 }
             )
     train = pd.DataFrame(rows)
@@ -488,7 +838,7 @@ def _load_kuairand(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             "Run bash scripts/download_kuairand_pure.sh"
         )
     print(f"reading {train_path}", flush=True)
-    train = _read_log(train_path)
+    train = _read_log(train_path, extra=True)
     print(f"reading {test_path}", flush=True)
     test = _read_log(test_path)
     return train, test
@@ -499,34 +849,37 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data/raw/KuaiRand-Pure/data"))
     parser.add_argument("--output", type=Path, default=Path("results/kuairand_pure_metrics.json"))
     parser.add_argument("--smoke", action="store_true", help="Run a tiny synthetic end-to-end eval")
-    parser.add_argument("--factors", type=int, default=64)
-    parser.add_argument("--als-iterations", type=int, default=15)
-    parser.add_argument("--als-alpha", type=float, default=40.0)
     parser.add_argument("--ranker-iterations", type=int, default=150)
     parser.add_argument("--ranker-depth", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=0.08)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    from pipelines.training.retrieval_tune import tune_retrievers
+
     if args.smoke:
         train, test = _synthetic_logs(args.seed)
-        factors = min(args.factors, 8)
-        als_iterations = min(args.als_iterations, 3)
         ranker_iterations = min(args.ranker_iterations, 10)
         ranker_depth = min(args.ranker_depth, 3)
+        smoke = True
     else:
-        train, test = _load_kuairand(args.data_dir)
-        factors = args.factors
-        als_iterations = args.als_iterations
+        train_path = args.data_dir / TRAIN_LOG
+        print(f"reading {train_path}", flush=True)
+        train = _read_log(train_path, extra=True)
+        test = None
         ranker_iterations = args.ranker_iterations
         ranker_depth = args.ranker_depth
-
+        smoke = False
+    # Hyperparameters are chosen before the random-policy log is read.
+    selection = tune_retrievers(train, seed=args.seed, smoke=smoke)
+    if test is None:
+        test_path = args.data_dir / TEST_LOG
+        print(f"reading {test_path}", flush=True)
+        test = _read_log(test_path)
     payload = run_eval(
         train,
         test,
-        factors=factors,
-        als_iterations=als_iterations,
-        als_alpha=args.als_alpha,
+        selection,
         ranker_iterations=ranker_iterations,
         ranker_depth=ranker_depth,
         learning_rate=args.learning_rate,
